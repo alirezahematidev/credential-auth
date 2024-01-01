@@ -1,12 +1,7 @@
 import { AxiosError, AxiosInstance } from "axios";
-import jwt from "jsonwebtoken";
+import * as jose from "jose";
 import createAuthRefreshInterceptor from "axios-auth-refresh";
-
-type LoggerMode = "log" | "error" | "warn";
-
-type AuthCustomLogger = {
-  [key in LoggerMode]: (...data: any[]) => void;
-};
+import EventEmitter from "eventemitter2";
 
 type TypeDefaultAsNull<T> = T | null;
 
@@ -15,9 +10,9 @@ type AuthStorageOptions = {
   storage?: Storage;
 };
 
-type AuthPayload = {
-  accessToken: string;
-  refreshToken: string;
+export type AuthPayload = {
+  readonly accessToken: string;
+  readonly refreshToken: string;
   expiresIn?: number;
 };
 
@@ -25,32 +20,30 @@ type AuthConfigOptions = {
   authorize: <T extends User>(user: T) => Promise<AuthPayload>;
   signOutCallback?: () => Promise<void>;
   storageOptions?: AuthStorageOptions;
-  customLogger?: AuthCustomLogger;
   scope?: string;
 };
 
-type User = {
+export type User = {
   [key: string]: any;
   sub: string;
 };
 
 type ExtendUser<T extends Record<string, any>> = Omit<T, "sub"> & User;
 
-class AuthLogger {
-  public logger: AuthCustomLogger;
-
-  constructor(customLogger?: AuthCustomLogger) {
-    const logger: AuthCustomLogger = {
-      log: (customLogger ?? console)["log"],
-      warn: (customLogger ?? console)["warn"],
-      error: (customLogger ?? console)["error"],
-    };
-
-    this.logger = logger;
-  }
+export interface AuthConfigMethods {
+  signIn<T extends User>(user: T): Promise<void>;
+  setUser(payload: AuthPayload): Promise<void>;
+  getUser<T extends Record<string, any>>(): Promise<TypeDefaultAsNull<ExtendUser<T>>>;
+  signOut(): Promise<void>;
+  checkAccessTokenIsExpired(handleRefreshToken: (refreshToken: string) => Promise<AuthPayload>): Promise<void>;
+  applyAxiosMiddleware(instance: AxiosInstance): void;
 }
 
-class AuthConfig extends AuthLogger {
+type AuthEvent = "SIGNIN" | "SIGNOUT" | "SETUSER";
+
+class AuthConfig implements AuthConfigMethods {
+  private readonly emitter: EventEmitter;
+
   private authorize: AuthConfigOptions["authorize"];
   private signOutCallback: AuthConfigOptions["signOutCallback"];
   private storageOptions: Required<AuthStorageOptions> = { key: "token", storage: localStorage };
@@ -59,8 +52,10 @@ class AuthConfig extends AuthLogger {
   private axiosInstance: TypeDefaultAsNull<AxiosInstance> = null;
   private axiosInterceptorEjectIds: number[] = [];
 
-  constructor({ authorize, signOutCallback, scope, customLogger, storageOptions }: AuthConfigOptions) {
-    super(customLogger);
+  private subscribers: Map<AuthEvent, () => void> = new Map();
+
+  constructor({ authorize, signOutCallback, scope, storageOptions }: AuthConfigOptions) {
+    this.emitter = new EventEmitter();
 
     this.authorize = authorize;
     this.signOutCallback = signOutCallback;
@@ -68,70 +63,97 @@ class AuthConfig extends AuthLogger {
     if (storageOptions) this.setStorageOptions(storageOptions, scope);
   }
 
-  public async signIn<T extends User>(user: T) {
+  public subscribe = <T>(event: AuthEvent, callback: (...data: T[]) => void) => {
+    this.emitter.on(event, callback);
+
+    const unsubscribe = () => {
+      this.emitter.off(event, callback);
+      this.subscribers.delete(event);
+    };
+
+    this.subscribers.set(event, unsubscribe);
+
+    return unsubscribe;
+  };
+
+  public unsubscribe = (event: AuthEvent) => {
+    this.subscribers.get(event)?.();
+  };
+
+  public signIn = async <T extends User>(user: T, onSuccess?: (payload: AuthPayload) => void) => {
     try {
       const payload = await this.authorize(user);
 
       if (!payload) {
-        this.logger.error("The authorize callback returns some invalid data");
+        console.error("The authorize callback returns some invalid data");
 
         return;
       }
 
-      await this.setUser(payload);
-
       this.user = user;
 
-      this.logger.log("The user has beed successfully signed in");
+      await this.setUser(payload);
+
+      this.emitter.emit("SIGNIN", { payload, user });
+
+      console.log("The user has beed successfully signed in");
+
+      if (onSuccess) onSuccess(payload);
     } catch (error) {
-      this.logger.error(error);
+      console.error(error);
+
+      this.user = null;
 
       this.storageOptions.storage.removeItem(this.storageOptions.key);
     }
-  }
+  };
 
-  public setUser(payload: AuthPayload) {
+  public setUser = (payload: AuthPayload) => {
     return new Promise<void>((resolve, reject) => {
       try {
         this.authPayload = payload;
 
         this.persistJWTTokenPayload(payload);
 
-        resolve();
+        this.emitter.emit("SETUSER", payload);
 
-        this.logger.log("The user payload has been successfully updated.");
+        console.log("The user payload has been successfully updated.");
+
+        resolve();
       } catch (error) {
-        this.logger.error(error);
+        console.error(error);
 
         reject(error);
       }
     });
-  }
+  };
 
-  public getUser<T extends Record<string, any>>() {
+  public getUser = <T extends Record<string, any>>() => {
     return new Promise<TypeDefaultAsNull<ExtendUser<T>>>((resolve, reject) => {
       try {
-        const token = this.storageOptions.storage.getItem(this.storageOptions.key);
+        const payload = this.storageOptions.storage.getItem(this.storageOptions.key);
 
-        if (token === null) return resolve(null);
+        if (payload === null) return resolve(null);
 
         return resolve(this.user as ExtendUser<T>);
       } catch (error) {
-        this.logger.error(error);
+        console.error(error);
 
         reject(error);
+
+        return resolve(null);
       }
     });
-  }
+  };
 
-  public async checkAccessTokenIsExpired(handleRefreshToken: (refreshToken: string) => Promise<AuthPayload>) {
+  public checkAccessTokenIsExpired = async (handleRefreshToken: (refreshToken: string) => Promise<AuthPayload>) => {
     if (!this.authPayload || !this.authPayload.accessToken) return;
 
-    const decodedToken = jwt.decode(this.authPayload.accessToken, { complete: true });
+    const payload = jose.decodeJwt(this.authPayload.accessToken);
 
-    if (decodedToken === null) return;
+    if (payload === null) return;
 
-    this.tryOverrideTokenExpiration(this.authPayload, decodedToken.payload);
+    this.tryOverrideTokenExpiration(this.authPayload, payload);
 
     if (this.authPayload.expiresIn && Date.now() > this.authPayload.expiresIn) {
       try {
@@ -139,26 +161,28 @@ class AuthConfig extends AuthLogger {
 
         await this.setUser(newPayload);
       } catch (error) {
-        this.logger.error(error);
+        console.error(error);
 
         this.ejectTriggeredInterceptors();
         this.storageOptions.storage.removeItem(this.storageOptions.key);
         this.user = null;
       }
     }
-  }
+  };
 
-  public async signOut() {
+  public signOut = async () => {
     this.storageOptions.storage.removeItem(this.storageOptions.key);
 
     this.user = null;
 
     this.ejectTriggeredInterceptors();
 
-    if (this.signOutCallback) await this.signOutCallback();
-  }
+    this.emitter.emit("SIGNOUT");
 
-  public applyAxiosMiddleware(instance: AxiosInstance) {
+    if (this.signOutCallback) await this.signOutCallback();
+  };
+
+  public applyAxiosMiddleware = (instance: AxiosInstance) => {
     this.axiosInstance = instance;
 
     this.axiosInterceptorEjectIds.push(
@@ -179,7 +203,7 @@ class AuthConfig extends AuthLogger {
 
           return Promise.reject(failedRequest);
         } catch (error) {
-          this.logger.error(error);
+          console.error(error);
 
           return Promise.reject(failedRequest);
         }
@@ -197,41 +221,37 @@ class AuthConfig extends AuthLogger {
         }
 
         return config;
-      }, this.logger.error)
+      }, console.error)
     );
-  }
+  };
 
-  private setStorageOptions(storageOptions: AuthStorageOptions, scope?: string) {
+  private setStorageOptions = (storageOptions: AuthStorageOptions, scope?: string) => {
     const key = storageOptions.key || this.storageOptions.key;
 
     this.storageOptions.key = scope ? scope + ":" + key : key;
 
     this.storageOptions.storage = storageOptions.storage || this.storageOptions.storage;
-  }
+  };
 
-  private persistJWTTokenPayload(payload: AuthPayload) {
+  private persistJWTTokenPayload = (payload: AuthPayload) => {
     this.storageOptions.storage.setItem(this.storageOptions.key, JSON.stringify(payload));
-  }
+  };
 
-  private tryOverrideTokenExpiration(authPayload: AuthPayload, jwtPayload: string | jwt.JwtPayload) {
-    if (typeof jwtPayload === "string" || authPayload.expiresIn) return;
+  private tryOverrideTokenExpiration = (authPayload: AuthPayload, jwtPayload: jose.JWTPayload) => {
+    if (authPayload.expiresIn) return;
 
-    if (jwtPayload.exp) {
-      authPayload.expiresIn = jwtPayload.exp;
-    }
-  }
+    if (jwtPayload.exp) authPayload.expiresIn = jwtPayload.exp;
+  };
 
-  private ejectTriggeredInterceptors() {
+  private ejectTriggeredInterceptors = () => {
     if (this.axiosInterceptorEjectIds.length === 0) return;
 
     this.axiosInterceptorEjectIds.forEach((id) => {
-      if (!this.axiosInstance) return;
-
-      this.axiosInstance.interceptors.request.eject(id);
+      this.axiosInstance?.interceptors.request.eject(id);
     });
 
     this.axiosInterceptorEjectIds = [];
-  }
+  };
 }
 
 export { AuthConfig };
